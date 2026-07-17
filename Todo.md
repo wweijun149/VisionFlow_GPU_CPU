@@ -285,3 +285,4 @@
 - [x] 2026-07-17：依目前 codebase 稽核並更新 `README.md` 與 `AGENT.md`，同步 Windows／RTX CI、shared preprocess plan、GPU session、CUDA preflight、打包 fallback smoke、專案模組地圖與實際驗證命令；未變更 runtime 行為或 RTX 實機驗收狀態。
 - [x] 2026-07-17：修正 Windows CLI smoke 的 exit code 判斷，明確接受 PASS=0 與 NG=2，並讓未捕捉例外等其他 exit code 正確使 CI 失敗。
 - [x] 2026-07-17：完成 P8 產線安全與持續驗證：strict detector schema/GUI 共用、recipe/build SHA-256/commit provenance、NG dataset sidecar、五配方與每 detector 至少五個合成 golden cases、Python 3.13 Windows lock、RTX 48h heartbeat/P95 15% gate/weekly package smoke、100-case Hypothesis preprocess fuzz，並拆分 GPU ABI 與 metrics；本機 CPU-compatible PyInstaller build 及 packaged smoke exit 0。
+- [x] 2026-07-17：新增根目錄 `CLAUDE.md` 作為 Claude Code 的快速索引（進入點、模組地圖、`gpu.mode`/PreprocessPlan/CPU fallback 不變量、唯一 roadmap 紀律與必跑驗證），與 `AGENT.md` 同一套規範；並將 `aoi-verify-push` 補成 repo 內版控的 `.claude/skills/aoi-verify-push/SKILL.md`，涵蓋驗證矩陣、Todo 更新、安全 staging 與 commit/push 流程。
