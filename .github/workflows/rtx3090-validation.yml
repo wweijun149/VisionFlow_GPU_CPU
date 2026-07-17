@@ -1,0 +1,117 @@
+name: RTX 3090 validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      production_manifest:
+        description: Optional PASS/NG production manifest path available on the runner
+        required: false
+        type: string
+  schedule:
+    - cron: "0 18 * * *"
+
+jobs:
+  cuda-runtime:
+    if: github.repository_owner == 'Wwjyun'
+    runs-on: [self-hosted, Windows, X64, gpu, rtx3090]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Prepare isolated environment
+        shell: pwsh
+        run: |
+          python -m venv env
+          .\env\Scripts\python.exe -m pip install -r requirements.lock.txt
+      - name: Record GPU toolchain
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force outputs_validation | Out-Null
+          nvidia-smi | Out-File -Encoding utf8 outputs_validation/gpu_environment.txt
+          nvcc --version | Out-File -Append -Encoding utf8 outputs_validation/gpu_environment.txt
+          where.exe cl | Out-File -Append -Encoding utf8 outputs_validation/gpu_environment.txt
+          git rev-parse HEAD | Out-File -Append -Encoding utf8 outputs_validation/gpu_environment.txt
+      - name: Build CUDA artifacts for RTX 3090
+        shell: pwsh
+        run: |
+          Start-Transcript -Path outputs_validation/cuda_build.log
+          try { .\gpu\build_cuda_dll.ps1 -Architecture sm_86 } finally { Stop-Transcript }
+      - name: Native ABI smoke
+        shell: pwsh
+        run: .\gpu\test_cuda_api.exe
+      - name: Restore accepted RTX benchmark baseline
+        id: baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: outputs_validation/baseline
+          key: rtx3090-benchmark-baseline-v1
+      - name: Equivalence and benchmark
+        shell: pwsh
+        run: |
+          $arguments = @(
+            "gpu\validate_cuda_dll.py",
+            "--warmup", "5",
+            "--benchmark", "20",
+            "--crossover",
+            "--morphology-profile",
+            "--stress", "10", "100", "1000",
+            "--json-output", "outputs_validation\rtx3090_benchmark.json"
+          )
+          $productionManifest = "${{ inputs.production_manifest }}"
+          if ($productionManifest) {
+            $arguments += @("--production-manifest", $productionManifest)
+          }
+          & .\env\Scripts\python.exe @arguments
+          if ($LASTEXITCODE -ne 0) { throw "CUDA validator failed with exit code $LASTEXITCODE" }
+      - name: Gate benchmark P95 regression
+        shell: pwsh
+        run: |
+          $baseline = "outputs_validation\baseline\rtx3090_benchmark.json"
+          if (-not (Test-Path $baseline)) {
+            New-Item -ItemType Directory -Force (Split-Path $baseline) | Out-Null
+            Copy-Item outputs_validation\rtx3090_benchmark.json $baseline
+            "Baseline initialized from this successful validation run."
+            exit 0
+          }
+          .\env\Scripts\python.exe gpu\benchmark_gate.py `
+            --current outputs_validation\rtx3090_benchmark.json `
+            --baseline $baseline --max-regression 0.15
+          if ($LASTEXITCODE -ne 0) { throw "RTX benchmark P95 regression exceeded 15%" }
+      - name: Save initial RTX benchmark baseline
+        if: steps.baseline.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: outputs_validation/baseline
+          key: rtx3090-benchmark-baseline-v1
+      - name: Capture Nsight Systems smoke profile
+        shell: pwsh
+        run: |
+          $nsys = Get-Command nsys -ErrorAction SilentlyContinue
+          if (-not $nsys) {
+            "nsys unavailable; Nsight capture skipped" | Tee-Object -FilePath outputs_validation/nsight_status.txt
+            exit 0
+          }
+          & $nsys.Source profile --force-overwrite true --sample none --trace cuda,nvtx,osrt `
+            --output outputs_validation/visionflow_cuda_smoke .\gpu\test_cuda_api.exe
+          if ($LASTEXITCODE -ne 0) { throw "nsys profile failed with exit code $LASTEXITCODE" }
+          "nsys capture completed" | Tee-Object -FilePath outputs_validation/nsight_status.txt
+      - name: Upload CUDA build and benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtx3090-${{ github.sha }}
+          path: |
+            gpu/visionflow_cuda.dll
+            gpu/visionflow_cuda.lib
+            gpu/test_cuda_api.exe
+            outputs_validation/cuda_build_stage/
+            outputs_validation/cuda_build_preflight.json
+            outputs_validation/cuda_build.log
+            outputs_validation/gpu_environment.txt
+            outputs_validation/rtx3090_benchmark.json
+            outputs_validation/nsight_status.txt
+            outputs_validation/**/*.nsys-rep
+          if-no-files-found: warn
