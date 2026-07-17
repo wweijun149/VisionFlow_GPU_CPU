@@ -177,6 +177,35 @@
 - [x] hosted CI 監測 RTX workflow 最近成功時間（超過 48 小時失敗）、benchmark 與 baseline 比較並 gate P95 退化，另有 weekly PyInstaller build + packaged smoke，Python 版本與部署版本一致。
 - [x] Hypothesis 隨機產生影像與合法 PreprocessPlan，驗證 CPU executor 與直接 OpenCV reference；固定生成順序可供 RTX CPU/GPU fuzzing，recipe/designer schema 與 GPU ABI/metrics 已拆成可 headless 測試模組。
 
+## P9：後續優化候選（效能、架構、可維護性）
+
+> 本區為 code review 後彙整的待評估候選，尚未實作。所有效能項目一律先加 profiler/benchmark 證明佔比，再依「不改變 recipe 語意、PASS/NG、座標與輸出格式」原則實作；不確定收益者不預設啟用。
+
+### 效能
+
+- [ ] 單張檢測的 tile × detector 迴圈目前完全序列（`pipeline.py` detector loop）；評估對 CPU 路徑加入 tile 級 `ThreadPoolExecutor` 平行（OpenCV 釋放 GIL），涵蓋 OP/Monitor/單張大圖多 tile 即時情境，並確保與 GPU session `RLock` 序列化不衝突。
+- [ ] Reporter 輸出（overlay PNG、ng_tiles、CSV、matrix CSV、JSON）目前序列寫出（`core/reporter.py`）；評估平行寫檔、降低 `IMWRITE_PNG_COMPRESSION` 等級或 overlay 改 JPG，並將多 NG tile 的逐張 PNG + 逐 tile JSON sidecar 合併，降低 I/O 放大。
+- [ ] Batch 每張影像重新 `RecipeManager().load()` + template sync（`pipeline.py` recipe_setup）；評估在 batch 層 parse 一次、共用 recipe dict，避免大量影像重複解析 YAML。
+- [ ] Batch worker 上限寫死 `min(4, cpu_count, ...)`（`batch_processor.py:_worker_count`）；評估依 CPU 核數、影像尺寸與 GPU throughput 模式動態調整，並與 OpenCV 內部執行緒數協調避免 oversubscription。
+- [ ] `gc.collect(0)` 每張影像呼叫（`batch_processor.py:_process_image`）；benchmark 確認是否造成不必要停頓，多數情況交回自動 GC 可能更快。
+- [ ] GPU tiling 對 pattern-match／contour tile 模式仍無法使用 resident image（`pipeline.py` 僅 grid 走 resident ROI）；評估將 resident ROI 擴充到非 grid 模式，消除 synchronous crop round trips 的負優化。
+
+### 架構與可維護性
+
+- [ ] `core/gpu_runtime.py`（~53KB 單檔）拆分為 ABI binding、resident image/ROI、metrics、fallback policy 等模組，降低維護與測試成本。
+- [ ] `AOIPipeline._run`（~220 行長方法）抽出 `ExecutionPlan`（GPU/CPU 與 resident 決策），讓主流程變薄、決策可獨立測試。
+- [ ] 核心結果結構（`execution.gpu.metrics...` 等深層 dict 字串 key 存取）改用 `TypedDict`/`dataclass`，降低打錯 key 與 refactor 風險。
+- [ ] 評估跨 detector 共用一份 tile preprocess 結果：目前 `TilePreprocessCache` 只快取 gray（`core/preprocess_cache.py`），相同 signature 的 resize/gaussian/adaptive 仍各 detector 重算。
+
+### 測試與 CI
+
+- [ ] PR CI 加入以合成資料跑的 `benchmark_gate` smoke 與 coverage gate，防止效能與覆蓋率悄悄退化（現況僅 windows-ci + 手動/nightly RTX）。
+
+### GUI 與產品
+
+- [ ] Batch dashboard／scatter 大資料量時的 UI 反應：評估表格虛擬化與圖表資料抽樣。
+- [ ] 新增 per-detector debug image export（threshold／contour／morphology 中間結果），提升現場調機效率，預設關閉僅工程模式開啟。
+
 ## RTX 3090 編譯與實機驗收
 
 ### 環境與編譯
