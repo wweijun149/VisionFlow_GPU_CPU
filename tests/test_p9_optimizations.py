@@ -208,6 +208,58 @@ class DebugImageExportTests(unittest.TestCase):
                 self.assertNotIn("_debug_images", tile_result)
 
 
+class OverlayOutputTests(unittest.TestCase):
+    def setUp(self):
+        recipe_manager._RECIPE_CACHE.clear()
+
+    def test_resolve_defaults_jpg_and_clamp(self):
+        self.assertEqual(Reporter._resolve_overlay_params({}), ("png", "png", 90, None))
+        self.assertEqual(
+            Reporter._resolve_overlay_params(
+                {"overlay_format": "jpeg", "overlay_jpeg_quality": 80, "overlay_max_dim": 512}
+            ),
+            ("jpg", "jpg", 80, 512),
+        )
+        self.assertEqual(Reporter._resolve_overlay_params({"overlay_jpeg_quality": 200})[2], 100)
+
+    def _run(self, overrides):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "input.png"
+            ok, buf = cv2.imencode(".png", multi_tile_image())
+            image_path.write_bytes(buf.tobytes())
+            base = {
+                "save_ng_tiles": False, "save_csv": False,
+                "save_matrix_csv": False, "save_json": True, "save_overlay": True,
+            }
+            result = AOIPipeline(
+                CIRCLE_RECIPE, root / "out", output_overrides={**base, **overrides}
+            ).run(image_path)
+            # Read facts while the temp dir still exists (it is removed on exit).
+            overlay_path = Path(result["outputs"]["overlay"])
+            exists = overlay_path.exists()
+            dims = cv2.imread(str(overlay_path)).shape[:2] if exists else None
+            return result, overlay_path.suffix, dims
+
+    def test_default_overlay_is_png(self):
+        _, suffix, dims = self._run({})
+        self.assertEqual(suffix, ".png")
+        self.assertIsNotNone(dims)
+
+    def test_jpg_overlay_written_and_decodable(self):
+        _, suffix, dims = self._run({"overlay_format": "jpg"})
+        self.assertEqual(suffix, ".jpg")
+        self.assertIsNotNone(dims)
+
+    def test_max_dim_downscales_preview_but_keeps_coordinates(self):
+        full_result, _, full_dims = self._run({})
+        small_result, _, small_dims = self._run({"overlay_max_dim": 256})
+        self.assertGreater(max(full_dims), 256)
+        self.assertLessEqual(max(small_dims), 256)
+        # Machine-readable tiles are unaffected by overlay preview settings.
+        self.assertEqual(normalized_tiles(full_result), normalized_tiles(small_result))
+
+
 class ResultSchemaContractTests(unittest.TestCase):
     def setUp(self):
         recipe_manager._RECIPE_CACHE.clear()

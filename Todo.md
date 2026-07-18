@@ -185,6 +185,7 @@
 
 - [x] 單張檢測 tile × detector 迴圈加入 opt-in 的 tile 級 CPU 平行（`pipeline.py` `_inspect_tiles_parallel`）：透過 `performance.tile_workers` 或 `AOI_TILE_WORKERS` 啟用，僅在純 CPU（無 GPU detector／resident image）時生效，使用 thread-local detector 集避免共用 instance state；預設 1（與原路徑逐位元一致），序列/平行等價已測。
 - [x] Reporter 輸出可設定 `png_compression`（預設維持 OpenCV 原值、位元組不變），多 NG tile 的 PNG/JSON sidecar 以 bounded thread pool 平行寫出（`ng_tile_write_workers`，PNG encode/寫檔釋放 GIL），保留 tile 順序。
+- [x] Overlay 存圖可設定 `overlay_format`（`png` 預設，位元組不變；`jpg` 供人看預覽）、`overlay_jpeg_quality` 與 `overlay_max_dim`（超過長邊才 INTER_AREA 降採樣）；overlay/NG tile/debug 仍以全解析度繪製，JSON/CSV 座標不受影響。實測 2048² overlay PNG 38.8ms→JPG 18.0ms（~2.1×）；`overlay_max_dim` 只在極大圖（如 17 億 px）encode 主導時才划算，一般尺寸 resize 成本反而略增，故預設不啟用。PASS 是否輸出維持既有 `save_overlay` 開關（GUI 已可決定），不新增自動略過。
 - [x] Recipe 以 path+mtime 為 key 的 process-wide 快取（`recipe_manager._RecipeCache`），batch/monitor 跨影像只 parse+validate 一次並回傳 deepcopy；on-disk 編輯經 mtime 失效自動 reload。
 - [x] Batch worker 上限由固定 4 改為 `min(8, cpu_count, ...)`，並以 `_opencv_thread_budget` 於批次期間分配 OpenCV 內部執行緒（結束還原），避免 oversubscription；`AOI_BATCH_WORKERS`／`max_workers` 仍可覆寫。
 - [x] `gc.collect(0)` 由每張改為可設定週期 `AOI_BATCH_GC_INTERVAL`（預設每 8 張，0 可停用），保留釋放大型 result 參考以控制 peak memory。
@@ -217,6 +218,7 @@
 - [ ] **RTX 驗證 tile 級平行不影響 GPU 路徑**：`AOI_TILE_WORKERS>1` 時確認純 CPU 才啟用、GPU detector/resident 影像維持序列（單一 GPU queue），無競爭或 VRAM 累積。
 - [ ] **以實機 benchmark 調校預設值**：worker 上限（8）、`AOI_BATCH_GC_INTERVAL`（8）、`png_compression` 與 `ng_tile_write_workers` 目前為保守預設；用固定資料集量測 median/P95、peak RSS 與輸出檔大小後，決定 production 建議值。
 - [ ] **coverage gate 逐步提高門檻**：現況 78%，待補 `tiler.py`／`monitor_processor.py`／`reporter` 測試後，將 `--fail-under` 由 70 分階段上調。
+- [ ] **image loader 尺寸/格式感知 hybrid（不可盲換 cv2.imread）**：實測 `cv2.imread` 對一般圖比 Pillow 快 3–12×，但 OpenCV `OPENCV_IO_MAX_IMAGE_PIXELS` 預設僅 1<<30（10.74 億 px），17000×100000＝17 億 px 會直接丟 `cv2.error`，且 cv2 不套 EXIF 方向。故 `Image.MAX_IMAGE_PIXELS=None` 的 Pillow 路徑必須保留為超大圖/帶方向影像的正確性主線。設計：Pillow lazy `open` 讀 header 拿尺寸→一般尺寸且無 EXIF 方向才走 cv2 快路徑，否則 Pillow 全解碼；全程 golden 等價（像素、方向、超大圖行為不變）。收益僅對一般尺寸批次，超大圖負載此項非主要槓桿。
 
 ## RTX 3090 編譯與實機驗收
 
@@ -328,3 +330,4 @@
 - [x] 2026-07-17：完成 P8 產線安全與持續驗證：strict detector schema/GUI 共用、recipe/build SHA-256/commit provenance、NG dataset sidecar、五配方與每 detector 至少五個合成 golden cases、Python 3.13 Windows lock、RTX 48h heartbeat/P95 15% gate/weekly package smoke、100-case Hypothesis preprocess fuzz，並拆分 GPU ABI 與 metrics；本機 CPU-compatible PyInstaller build 及 packaged smoke exit 0。
 - [x] 2026-07-17：新增根目錄 `CLAUDE.md` 作為 Claude Code 的快速索引（進入點、模組地圖、`gpu.mode`/PreprocessPlan/CPU fallback 不變量、唯一 roadmap 紀律與必跑驗證），與 `AGENT.md` 同一套規範；並將 `aoi-verify-push` 補成 repo 內版控的 `.claude/skills/aoi-verify-push/SKILL.md`，涵蓋驗證矩陣、Todo 更新、安全 staging 與 commit/push 流程。
 - [x] 2026-07-18：完成 P9 第一批 CPU 優化並以 `tests/test_p9_optimizations.py`（12 案）驗證：process-wide recipe 快取（path+mtime，deepcopy，mtime 失效）、batch worker 上限 4→`min(8,cpu)` 加 `_opencv_thread_budget` 還原、`AOI_BATCH_GC_INTERVAL` 週期 GC、Reporter `png_compression`＋NG tile 平行寫、opt-in tile 級 CPU 平行（thread-local detectors，序列/平行等價）、per-detector debug image export（共用 preprocess 出口，涵蓋四 detector，不進 JSON）、`_run` 抽出 `_build_gpu_runtime`、`core/result_types.py` TypedDict 契約與 contract test、Windows CI coverage gate（`--fail-under=70`，現況 76%）＋tile-parallel smoke。全套 119 tests 綠燈、compileall／cuda preflight 通過、6 影像 batch E2E（54 tiles/54 debug/0 error）實跑成功。resident-ROI 非 grid、`gpu_runtime` 拆分、跨 detector cache 與 dashboard 虛擬化因需 RTX 或屬高風險／GUI 效能另案，於 P9 標註延後與理由。
+- [x] 2026-07-18：新增 overlay 輸出策略（`overlay_format` png/jpg、`overlay_jpeg_quality`、`overlay_max_dim`）並加 4 個測試（`tests/test_p9_optimizations.py`，共 123 tests 綠燈）；預設 PNG 位元組不變，overlay 全解析度繪製後才降採樣故 JSON/CSV 座標不變，實測 2048² overlay PNG 38.8ms→JPG 18.0ms。經確認 image loader 不可盲換 cv2.imread（OpenCV `1<<30` 像素上限低於 17 億 px 巨圖且會丟 error、又不套 EXIF），保留 Pillow `MAX_IMAGE_PIXELS=None` 主線，尺寸/格式感知 hybrid 列入 P9 後續工作；PASS overlay 依既有 `save_overlay` 開關，不新增自動略過。
