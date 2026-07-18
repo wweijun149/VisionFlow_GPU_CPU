@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
@@ -16,6 +19,7 @@ from core.provenance import inspection_provenance
 from core.recipe_manager import RecipeManager
 from core.recipe_builder import RecipeTemplatePathSync
 from core.reporter import Reporter
+from core.result_types import InspectionResult
 from core.result_mapper import map_tile_result_to_global
 from core.tiler import create_tiler
 
@@ -41,13 +45,13 @@ class AOIPipeline(LogMixin):
         self._active_profiler = None
         self._last_progress_percent = None
 
-    def run(self, image_path: Path) -> dict:
+    def run(self, image_path: Path) -> InspectionResult:
         if self.gpu_session is not None:
             with self.gpu_session.execution_scope():
                 return self._run(image_path)
         return self._run(image_path)
 
-    def _run(self, image_path: Path) -> dict:
+    def _run(self, image_path: Path) -> InspectionResult:
         started = time.perf_counter()
         profiler = PipelineProfiler()
         self._active_profiler = profiler
@@ -74,17 +78,7 @@ class AOIPipeline(LogMixin):
             gpu_requested = tiling_gpu_requested or detector_gpu_allowed and any(
                 bool(config.get("use_gpu", False)) for config in detector_configs.values()
             )
-            gpu_runtime = (
-                self.gpu_session.runtime_for(gpu_config, gpu_requested)
-                if self.gpu_session is not None
-                else GpuRuntime(
-                    gpu_config.get("dll_path", GpuRuntime.DEFAULT_DLL),
-                    fallback_to_cpu=self.recipe_manager.gpu_fallback_enabled(gpu_config),
-                    enabled=gpu_requested,
-                    queue_depth=1,
-                    workload="latency",
-                )
-            )
+            gpu_runtime = self._build_gpu_runtime(gpu_config, gpu_requested)
         if gpu_requested and not gpu_runtime.available and not gpu_runtime.fallback_to_cpu:
             raise GpuRuntimeError(gpu_runtime.unavailable_reason)
         if gpu_requested and gpu_runtime.available:
@@ -126,7 +120,9 @@ class AOIPipeline(LogMixin):
             if not detector_gpu_allowed:
                 for config in detector_configs.values():
                     config["use_gpu"] = False
+            debug_images_requested = bool(recipe["output"].get("save_debug_images", False))
             detectors = self.detector_manager.create_enabled(detector_configs, gpu_runtime=gpu_runtime)
+            self._apply_debug_flag(detectors, debug_images_requested)
         self.logger.info("Detectors initialized: count=%s ids=%s", len(detectors), [d.detector_id for d in detectors])
         self._progress(15, "Detectors initialized")
 
@@ -144,57 +140,17 @@ class AOIPipeline(LogMixin):
         self.logger.info("Tiles prepared: count=%s mode=%s", len(tiles), tile_config.get("mode", "grid"))
         self._progress(20, f"Tiles prepared: {len(tiles)}")
 
-        tile_results = []
         total_work = max(len(tiles) * max(len(detectors), 1), 1)
-        completed_work = 0
+        tile_workers = self._tile_worker_count(recipe, detectors, resident_image, len(tiles))
         with profiler.measure("detectors_total"):
-            for tile_index, tile in enumerate(tiles, start=1):
-                detector_results = []
-                preprocess_cache = TilePreprocessCache(tile.image)
-                for detector in detectors:
-                    with profiler.measure(f"detector:{detector.detector_id}"):
-                        detector_result = detector.run(
-                            tile.image,
-                            device_roi=tile.device_roi,
-                            preprocess_cache=preprocess_cache,
-                        )
-                        for stage, duration in (
-                            detector_result.get("execution", {})
-                            .get("performance", {})
-                            .get("stages_sec", {})
-                            .items()
-                        ):
-                            profiler.add_duration(
-                                f"detector_stage:{detector.detector_id}:{stage}", duration
-                            )
-                        detector_results.append(map_tile_result_to_global(tile, detector_result))
-                    completed_work += 1
-                    percent = 20 + int(completed_work / total_work * 60)
-                    self._progress(
-                        min(percent, 80),
-                        f"Inspecting tile {tile_index}/{len(tiles)} with detector {detector.detector_id}",
-                    )
-
-                if not detectors:
-                    completed_work += 1
-                    percent = 20 + int(completed_work / total_work * 60)
-                    self._progress(min(percent, 80), f"Preparing tile {tile_index}/{len(tiles)}")
-
-                tile_results.append(
-                    {
-                        "tile": {
-                            "tile_id": tile.tile_id,
-                            "x": tile.x,
-                            "y": tile.y,
-                            "width": tile.width,
-                            "height": tile.height,
-                            "row": tile.row,
-                            "col": tile.col,
-                            "metadata": tile.metadata or {},
-                        },
-                        "detectors": detector_results,
-                        "_tile_image": tile.image,
-                    }
+            if tile_workers > 1:
+                tile_results = self._inspect_tiles_parallel(
+                    tiles, detector_configs, gpu_runtime, profiler, tile_workers,
+                    debug_images_requested,
+                )
+            else:
+                tile_results = self._inspect_tiles_serial(
+                    tiles, detectors, profiler, total_work
                 )
 
         detector_fallbacks = {
@@ -271,6 +227,165 @@ class AOIPipeline(LogMixin):
         self._progress(100, "Inspection complete")
         return serializable_result
 
+    def _build_gpu_runtime(self, gpu_config: dict, gpu_requested: bool):
+        """Reuse the session runtime when batching, else build a latency runtime.
+
+        Isolates the GPU/CPU execution decision from the main inspection flow so
+        `_run` reads as a linear pipeline.
+        """
+        if self.gpu_session is not None:
+            return self.gpu_session.runtime_for(gpu_config, gpu_requested)
+        return GpuRuntime(
+            gpu_config.get("dll_path", GpuRuntime.DEFAULT_DLL),
+            fallback_to_cpu=self.recipe_manager.gpu_fallback_enabled(gpu_config),
+            enabled=gpu_requested,
+            queue_depth=1,
+            workload="latency",
+        )
+
+    def _inspect_tile(self, tile, detectors) -> tuple[dict, list]:
+        """Run every detector over one tile; return the tile result and timings.
+
+        Timings are returned rather than written to the profiler so this can run
+        on a worker thread while the (non-thread-safe) profiler is only ever
+        touched from the main thread.
+        """
+        detector_results = []
+        timings = []
+        debug_images: dict = {}
+        preprocess_cache = TilePreprocessCache(tile.image)
+        for detector in detectors:
+            started = time.perf_counter()
+            detector_result = detector.run(
+                tile.image,
+                device_roi=tile.device_roi,
+                preprocess_cache=preprocess_cache,
+            )
+            detector_results.append(map_tile_result_to_global(tile, detector_result))
+            wall = time.perf_counter() - started
+            stages = (
+                detector_result.get("execution", {})
+                .get("performance", {})
+                .get("stages_sec", {})
+            )
+            timings.append((detector.detector_id, wall, dict(stages)))
+            if detector.export_debug_images and detector.debug_images:
+                debug_images[detector.detector_id] = dict(detector.debug_images)
+        tile_result = {
+            "tile": {
+                "tile_id": tile.tile_id,
+                "x": tile.x,
+                "y": tile.y,
+                "width": tile.width,
+                "height": tile.height,
+                "row": tile.row,
+                "col": tile.col,
+                "metadata": tile.metadata or {},
+            },
+            "detectors": detector_results,
+            "_tile_image": tile.image,
+        }
+        if debug_images:
+            tile_result["_debug_images"] = debug_images
+        return tile_result, timings
+
+    @staticmethod
+    def _record_tile_timings(profiler, timings) -> None:
+        for detector_id, wall, stages in timings:
+            profiler.add_duration(f"detector:{detector_id}", wall)
+            for stage, duration in stages.items():
+                profiler.add_duration(f"detector_stage:{detector_id}:{stage}", duration)
+
+    def _inspect_tiles_serial(self, tiles, detectors, profiler, total_work) -> list[dict]:
+        tile_results: list[dict] = []
+        completed_work = 0
+        for tile_index, tile in enumerate(tiles, start=1):
+            tile_result, timings = self._inspect_tile(tile, detectors)
+            self._record_tile_timings(profiler, timings)
+            step = max(len(detectors), 1)
+            completed_work += step
+            percent = 20 + int(completed_work / total_work * 60)
+            if detectors:
+                message = (
+                    f"Inspecting tile {tile_index}/{len(tiles)} with detector "
+                    f"{detectors[-1].detector_id}"
+                )
+            else:
+                message = f"Preparing tile {tile_index}/{len(tiles)}"
+            self._progress(min(percent, 80), message)
+            tile_results.append(tile_result)
+        return tile_results
+
+    @staticmethod
+    def _apply_debug_flag(detectors, enabled: bool) -> None:
+        for detector in detectors:
+            detector.export_debug_images = bool(enabled)
+
+    def _inspect_tiles_parallel(
+        self, tiles, detector_configs, gpu_runtime, profiler, workers, debug_images=False
+    ) -> list[dict]:
+        """CPU-only tile fan-out with per-thread detector sets.
+
+        Detectors carry per-run instance state, so each worker thread builds and
+        reuses its own detector instances (keeping each thread's plan cache warm)
+        instead of sharing the main-thread detectors.
+        """
+        local = threading.local()
+
+        def thread_detectors():
+            detectors = getattr(local, "detectors", None)
+            if detectors is None:
+                detectors = self.detector_manager.create_enabled(
+                    detector_configs, gpu_runtime=gpu_runtime
+                )
+                self._apply_debug_flag(detectors, debug_images)
+                local.detectors = detectors
+            return detectors
+
+        def work(indexed_tile):
+            index, tile = indexed_tile
+            tile_result, timings = self._inspect_tile(tile, thread_detectors())
+            return index, tile_result, timings
+
+        results: list[dict | None] = [None] * len(tiles)
+        total = len(tiles)
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for index, tile_result, timings in executor.map(work, enumerate(tiles)):
+                results[index] = tile_result
+                self._record_tile_timings(profiler, timings)
+                completed += 1
+                percent = 20 + int(completed / total * 60)
+                self._progress(min(percent, 80), f"Inspecting tile {completed}/{total}")
+        return results
+
+    @staticmethod
+    def _tile_worker_count(recipe, detectors, resident_image, tile_count) -> int:
+        """Resolve tile-level worker count; only enabled for pure-CPU inspection.
+
+        Returns 1 (fully sequential, byte-identical to the original path) unless
+        explicitly opted in via recipe ``performance.tile_workers`` or the
+        ``AOI_TILE_WORKERS`` env var, and never when GPU detectors or a resident
+        device image are active (those already serialise on the GPU lock).
+        """
+        if tile_count <= 1 or not detectors:
+            return 1
+        if resident_image is not None:
+            return 1
+        if any(getattr(detector, "gpu_active", False) for detector in detectors):
+            return 1
+        configured = (recipe.get("performance", {}) or {}).get("tile_workers")
+        if configured is None:
+            configured = os.getenv("AOI_TILE_WORKERS")
+        try:
+            workers = int(configured) if configured is not None else 1
+        except (TypeError, ValueError):
+            workers = 1
+        if workers <= 1:
+            return 1
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(workers, cpu_count, tile_count))
+
     def _progress(self, percent: int, message: str) -> None:
         if self.progress_callback is None:
             return
@@ -292,5 +407,6 @@ class AOIPipeline(LogMixin):
         for tile_result in result["tiles"]:
             cleaned_tile = dict(tile_result)
             cleaned_tile.pop("_tile_image", None)
+            cleaned_tile.pop("_debug_images", None)
             cleaned["tiles"].append(cleaned_tile)
         return cleaned

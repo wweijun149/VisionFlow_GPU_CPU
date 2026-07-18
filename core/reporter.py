@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -21,11 +22,13 @@ class Reporter(LogMixin):
         self.output_dir = Path(output_dir)
         self.output_config = output_config or {}
         self.profiler = profiler
+        self._png_params = self._resolve_png_params(self.output_config)
         self.overlay_dir = self.output_dir / "overlay"
         self.ng_tiles_dir = self.output_dir / "ng_tiles"
         self.csv_dir = self.output_dir / "csv"
         self.matrix_csv_dir = self.output_dir / "matrix_csv"
         self.json_dir = self.output_dir / "json"
+        self.debug_dir = self.output_dir / "debug"
         for directory in (self.overlay_dir, self.ng_tiles_dir, self.csv_dir, self.matrix_csv_dir, self.json_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +63,12 @@ class Reporter(LogMixin):
                 self._write_matrix_csv(matrix_csv_path, result)
                 outputs["matrix_csv"] = str(matrix_csv_path)
 
+        if self.output_config.get("save_debug_images", False):
+            with self._measure("debug_images"):
+                debug_paths = self._write_debug_images(result, base_name)
+                if debug_paths:
+                    outputs["debug_images"] = debug_paths
+
         if self.output_config.get("save_json", True):
             if self.profiler is not None:
                 result.setdefault("execution", {})["performance"] = self.profiler.snapshot()
@@ -77,6 +86,27 @@ class Reporter(LogMixin):
             return nullcontext()
         return self.profiler.measure(f"report:{name}")
 
+    def _write_debug_images(self, result: dict, base_name: str) -> list[str]:
+        """Write per-detector preprocess intermediates for engineering debug.
+
+        Only runs when ``save_debug_images`` is enabled; images are carried on the
+        runtime-only ``_debug_images`` tile key that never reaches JSON.
+        """
+        written: list[str] = []
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        for tile_result in result.get("tiles", []):
+            debug_images = tile_result.get("_debug_images")
+            if not debug_images:
+                continue
+            tile_id = tile_result.get("tile", {}).get("tile_id", "tile")
+            for detector_id, stages in debug_images.items():
+                for stage_name, image in stages.items():
+                    safe = str(stage_name).replace("/", "_").replace(":", "_")
+                    path = self.debug_dir / f"{base_name}_{tile_id}_{detector_id}_{safe}.png"
+                    self._write_png(path, image)
+                    written.append(str(path))
+        return written
+
     @staticmethod
     def _json_safe_result(result: dict, outputs: dict[str, object]) -> dict:
         cleaned = dict(result)
@@ -85,6 +115,7 @@ class Reporter(LogMixin):
         for tile_result in result["tiles"]:
             cleaned_tile = dict(tile_result)
             cleaned_tile.pop("_tile_image", None)
+            cleaned_tile.pop("_debug_images", None)
             cleaned["tiles"].append(cleaned_tile)
         return cleaned
 
@@ -156,7 +187,7 @@ class Reporter(LogMixin):
         cv2.rectangle(overlay, (x, y), (x + width, y + height), (0, 0, 255), 4)
 
     def _write_ng_tiles(self, result: dict, base_name: str) -> list[str]:
-        sidecars: list[str] = []
+        pending = []
         for tile_result in result["tiles"]:
             if tile_result.get("result") != "NG":
                 continue
@@ -165,13 +196,39 @@ class Reporter(LogMixin):
             if tile_image is None:
                 continue
             path = self.ng_tiles_dir / f"{base_name}_{tile['tile_id']}.png"
-            self._write_png(path, self._make_ng_tile_overlay(tile_image, tile_result))
-            sidecar_path = path.with_suffix(".json")
             sidecar = self._ng_tile_sidecar(result, tile_result, path.name)
-            with sidecar_path.open("w", encoding="utf-8") as handle:
-                json.dump(sidecar, handle, ensure_ascii=False, indent=2)
-            sidecars.append(str(sidecar_path))
-        return sidecars
+            pending.append((tile_result, tile_image, path, sidecar))
+
+        if not pending:
+            return []
+
+        # PNG encode and disk writes release the GIL, so a small pool cuts the
+        # per-NG-tile I/O that dominates when many tiles fail. Ordering of the
+        # returned sidecars is preserved to match the tile iteration order.
+        workers = min(len(pending), self._ng_tile_workers())
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                list(executor.map(lambda item: self._write_single_ng_tile(*item), pending))
+        else:
+            for item in pending:
+                self._write_single_ng_tile(*item)
+
+        return [str(path.with_suffix(".json")) for _, _, path, _ in pending]
+
+    def _write_single_ng_tile(self, tile_result: dict, tile_image, path: Path, sidecar: dict) -> None:
+        self._write_png(path, self._make_ng_tile_overlay(tile_image, tile_result))
+        sidecar_path = path.with_suffix(".json")
+        with sidecar_path.open("w", encoding="utf-8") as handle:
+            json.dump(sidecar, handle, ensure_ascii=False, indent=2)
+
+    def _ng_tile_workers(self) -> int:
+        configured = self.output_config.get("ng_tile_write_workers")
+        if configured is not None:
+            try:
+                return max(1, int(configured))
+            except (TypeError, ValueError):
+                pass
+        return 4
 
     @staticmethod
     def _ng_tile_sidecar(result: dict, tile_result: dict, image_file: str) -> dict:
@@ -440,11 +497,24 @@ class Reporter(LogMixin):
         return x1, y1, x2 - x1, y2 - y1
 
     @staticmethod
-    def _write_png(path: Path, image) -> None:
+    def _resolve_png_params(output_config: dict) -> list[int]:
+        """PNG imencode params from recipe output config.
+
+        Absent config keeps OpenCV's default compression so existing outputs are
+        byte-identical; setting ``png_compression`` (0-9) trades file size for
+        encode speed on large overlays and NG tiles.
+        """
+        compression = output_config.get("png_compression")
+        if compression is None:
+            return []
+        level = max(0, min(9, int(compression)))
+        return [cv2.IMWRITE_PNG_COMPRESSION, level]
+
+    def _write_png(self, path: Path, image) -> None:
         if image is None or getattr(image, "size", 0) == 0:
             raise ValueError(f"Cannot write empty PNG image: {path}")
 
-        ok, encoded = cv2.imencode(".png", image)
+        ok, encoded = cv2.imencode(".png", image, self._png_params)
         if not ok:
             raise OSError(f"OpenCV failed to encode PNG image: {path}")
 
