@@ -64,10 +64,14 @@ Recipe 是本系統的核心設定來源，內容包含：
 
 目前主要 detector 包含：
 
-- `401-1`：adaptive mean threshold 與圓形輪廓檢測，用於找出符合條件的圓形 NG 特徵。
 - `401`：negative-pole rotated rectangle NG detector，用於負極區域的旋轉矩形異常檢測。
+- `401-1`：adaptive mean threshold 與圓形輪廓檢測，用於找出符合條件的圓形 NG 特徵。
+- `401-2`：adaptive white-pixel ratio detector，計算輪廓範圍內白像素比例，超過門檻即判定 NG。
+- `900`：dual-frame spacing detector，找出外框與內框並檢查左、上、右、下四個邊距。
 
 Detector 輸出格式一致，包含 detector id、display name、PASS / NG、score、defect list、bbox、area、confidence 與 metadata。這讓後續新增 AI detector 或其他 CV detector 時，可以沿用相同 pipeline。
+
+所有 detector 只宣告 backend-neutral 的 `PreprocessPlan`（Gray、Resize、Gaussian、Threshold、AdaptiveMean、Morphology 等 typed operators），由 `CpuPreprocessExecutor`（正確性基準）或可選的 `CudaPreprocessExecutor` 執行，避免每個 detector 各自維護一套 CUDA 流程。啟用 `output.save_debug_images` 時，可統一從共用前處理出口輸出四個 detector 的中間 mask 供現場調機。
 
 ### 4.4 PASS / NG 彙總
 
@@ -91,6 +95,24 @@ Detector 輸出格式一致，包含 detector id、display name、PASS / NG、sc
 - Matrix CSV：以 row / column 形式呈現 tile NG 分布，適合陣列型產品。
 - JSON：完整檢測結果，保留 tile、detector、defect、輸出路徑與統計資料。
 - Log：CLI 與 GUI 都會寫入 rotating log，方便追查執行問題。
+
+### 4.6 CPU 基準與可選 CUDA 加速
+
+系統以 CPU 為完整受支援模式，也是結果正確性的基準；GPU 為可選加速後端。前處理由 backend-neutral 的 `PreprocessPlan` 描述，再由 CPU 或 CUDA executor 執行相同的 typed operators：
+
+- `gpu.mode` 具備清楚語意：`cpu` 完全不載入 CUDA、`auto` 可安全回退、`cuda` 要求成功且禁止隱藏 CPU fallback。
+- 未安裝 NVIDIA GPU 或缺少 `visionflow_cuda.dll` 時，系統仍可完整以 CPU 執行 CLI、GUI、批次與監控。
+- GPU step 失敗時整個 detector 從 CPU 重跑，不混用部分 GPU 中間結果。
+- CUDA 原始碼已具備 separable Gaussian、64-bit integral Adaptive Mean、persistent context、grow-only buffers 與通用 native plan／DAG。這些功能仍待 RTX 3090（`sm_86`）完成正式編譯、五份配方等價、效能與長時間穩定度驗收後，才會視為 production-ready 或預設啟用。
+
+### 4.7 CPU 效能選項（可選）
+
+為兼顧正確性與吞吐，系統提供多項 opt-in 的 CPU 效能選項，預設維持與舊版逐位元一致：
+
+- 純 CPU 情境可經 `performance.tile_workers`／`AOI_TILE_WORKERS` 啟用 tile 級平行（thread-local detector，序列/平行結果等價由測試固定）。
+- 批次 worker 數依 CPU 核數動態調整並協調 OpenCV 內部執行緒數，避免 oversubscription；`gc.collect` 改為可設定週期。
+- 配方以 path+mtime 快取，批次／監控跨影像只解析與驗證一次。
+- Reporter 的 NG 小圖可平行寫檔；overlay 可設定輸出格式（PNG／JPG）、品質與降採樣長邊。
 
 ## 5. GUI 功能
 
@@ -230,28 +252,34 @@ OOP 模組化設計讓檢測器可以獨立新增，Reporter、Aggregator、Tile
 目前專案已完成：
 
 - AOI pipeline 主流程。
-- YAML Recipe 載入與驗證。
-- Grid、Pattern Match、Contour 切圖模式。
-- 401 與 401-1 detector。
-- 單張檢測 GUI。
-- OP mode。
+- YAML Recipe 載入、驗證（strict schema）與 SHA-256／build commit provenance。
+- Grid、模板定位網格、Pattern Match、Contour 四種切圖模式。
+- 401、401-1、401-2、900 四個傳統 CV detector。
+- backend-neutral `PreprocessPlan` 與 CPU／CUDA executor 抽象層。
+- 可選 CUDA 加速後端與完整 CPU fallback（`auto`／`cpu`／`cuda`）。
+- 單張檢測 GUI，以及 OP／Engineer／Admin 操作模式。
 - Recipe Designer 與 Recipe 儲存。
-- Batch folder inspection。
+- Batch folder inspection（動態 worker、配方快取）。
 - Batch Dashboard 與 tile scatter chart。
 - Monitor folder inspection。
-- Overlay、NG tiles、CSV、matrix CSV、JSON 報表輸出。
+- Overlay、NG tiles、CSV、matrix CSV、JSON 報表輸出與 NG dataset sidecar。
+- 可選 per-detector 除錯影像輸出與 tile 級 CPU 平行。
 - Rotating log。
-- Windows GUI executable package。
+- Windows GUI executable package 與打包版 smoke。
+- Windows CI（含 coverage gate）與隔離的 RTX 3090 self-hosted runner workflow。
 
 ## 9. 限制與後續發展
 
 目前仍可加強的方向：
 
 - 建立正式 validation dataset，用於量化誤判率、漏判率與不同 Recipe 的表現。
-- 增加 per-detector debug image export，讓調機時可以看到 threshold、contour、morphology 等中間結果。
+- 完成 RTX 3090（`sm_86`）CUDA 編譯、五份 production recipes CPU/GPU 等價、效能與長時間 VRAM 穩定度驗收，才能將 GPU 預設啟用。
 - 擴充 AI detector plugin，例如 YOLO、RT-DETR 或 segmentation model。
 - 增加更多報表欄位，例如 OP ID、lot ID、station ID、recipe change history。
 - 與 MES、資料庫或產線檔案系統整合，形成更完整的生產追溯流程。
+- Batch Dashboard／scatter 在大資料量時的表格虛擬化與圖表抽樣。
+
+> 註：per-detector debug image export 已於 `output.save_debug_images` 提供，涵蓋四個 detector 的中間 mask。
 
 ## 10. 報告結論
 
