@@ -23,6 +23,9 @@ class Reporter(LogMixin):
         self.output_config = output_config or {}
         self.profiler = profiler
         self._png_params = self._resolve_png_params(self.output_config)
+        self._overlay_format, self._overlay_ext, self._overlay_jpeg_quality, self._overlay_max_dim = (
+            self._resolve_overlay_params(self.output_config)
+        )
         self.overlay_dir = self.output_dir / "overlay"
         self.ng_tiles_dir = self.output_dir / "ng_tiles"
         self.csv_dir = self.output_dir / "csv"
@@ -41,8 +44,9 @@ class Reporter(LogMixin):
 
         if self.output_config.get("save_overlay", True):
             with self._measure("overlay"):
-                overlay_path = self.overlay_dir / f"{base_name}_overlay.png"
-                self._write_png(overlay_path, self._make_overlay(image, result))
+                overlay = self._maybe_downscale_overlay(self._make_overlay(image, result))
+                overlay_path = self.overlay_dir / f"{base_name}_overlay.{self._overlay_ext}"
+                self._write_overlay_image(overlay_path, overlay)
                 outputs["overlay"] = str(overlay_path)
 
         if self.output_config.get("save_ng_tiles", True):
@@ -509,6 +513,62 @@ class Reporter(LogMixin):
             return []
         level = max(0, min(9, int(compression)))
         return [cv2.IMWRITE_PNG_COMPRESSION, level]
+
+    @staticmethod
+    def _resolve_overlay_params(output_config: dict) -> tuple[str, str, int, int | None]:
+        """Overlay encode/downscale policy from recipe output config.
+
+        Defaults keep the existing lossless full-resolution PNG so outputs are
+        byte-identical. ``overlay_format: jpg`` and ``overlay_max_dim`` trade the
+        human-viewing preview's fidelity for far cheaper encoding on large images
+        (all machine-readable outputs keep full-resolution coordinates).
+        """
+        fmt = str(output_config.get("overlay_format", "png")).lower()
+        if fmt in {"jpg", "jpeg"}:
+            fmt, ext = "jpg", "jpg"
+        else:
+            fmt, ext = "png", "png"
+        quality = max(1, min(100, int(output_config.get("overlay_jpeg_quality", 90))))
+        max_dim_raw = output_config.get("overlay_max_dim")
+        max_dim = None
+        if max_dim_raw is not None:
+            try:
+                max_dim = max(1, int(max_dim_raw))
+            except (TypeError, ValueError):
+                max_dim = None
+        return fmt, ext, quality, max_dim
+
+    def _maybe_downscale_overlay(self, overlay):
+        """Shrink the saved overlay preview when it exceeds overlay_max_dim.
+
+        Boxes/labels are drawn at full resolution first, so this only affects the
+        preview image; JSON/CSV coordinates remain full-resolution.
+        """
+        if not self._overlay_max_dim or overlay is None:
+            return overlay
+        height, width = overlay.shape[:2]
+        longest = max(height, width)
+        if longest <= self._overlay_max_dim:
+            return overlay
+        scale = self._overlay_max_dim / float(longest)
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        return cv2.resize(overlay, new_size, interpolation=cv2.INTER_AREA)
+
+    def _write_overlay_image(self, path: Path, image) -> None:
+        if image is None or getattr(image, "size", 0) == 0:
+            raise ValueError(f"Cannot write empty overlay image: {path}")
+        if self._overlay_format == "jpg":
+            ext, params = ".jpg", [cv2.IMWRITE_JPEG_QUALITY, self._overlay_jpeg_quality]
+        else:
+            ext, params = ".png", self._png_params
+        ok, encoded = cv2.imencode(ext, image, params)
+        if not ok:
+            raise OSError(f"OpenCV failed to encode overlay image: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_bytes(encoded.tobytes())
+        except OSError as exc:
+            raise OSError(f"Failed to write overlay image to {path}: {exc}") from exc
 
     def _write_png(self, path: Path, image) -> None:
         if image is None or getattr(image, "size", 0) == 0:
