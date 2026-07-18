@@ -17,9 +17,13 @@ jobs:
           python-version: "3.13"
           cache: pip
       - name: Install dependencies
-        run: python -m pip install -r requirements.lock.txt
-      - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        run: |
+          python -m pip install -r requirements.lock.txt
+          python -m pip install coverage
+      - name: Unit tests with coverage gate
+        run: |
+          coverage run --source=core,detectors -m unittest discover -s tests -v
+          coverage report --fail-under=70
       - name: Compile Python sources
         run: python -m compileall main.py core detectors gui gpu
       - name: Validate CUDA headers and source contract
@@ -32,6 +36,16 @@ jobs:
           python main.py --image outputs_validation/ci_input.png --recipe recipes/PRODUCT_A_NEGATIVE_401_AOI_01.yaml --output outputs_validation/ci_cli
           $cliExitCode = $LASTEXITCODE
           if ($cliExitCode -notin @(0, 2)) { exit $cliExitCode }
+          exit 0
+      - name: Tile-parallel CPU smoke
+        shell: pwsh
+        env:
+          AOI_TILE_WORKERS: "4"
+        run: |
+          python -c "import cv2,numpy as np; cv2.imwrite('outputs_validation/ci_big.png', np.zeros((1100,1100,3),np.uint8))"
+          python main.py --image outputs_validation/ci_big.png --recipe recipes/PRODUCT_A_NEGATIVE_401_AOI_01.yaml --output outputs_validation/ci_parallel
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -notin @(0, 2)) { exit $exitCode }
           exit 0
       - name: GUI offscreen smoke
         shell: pwsh

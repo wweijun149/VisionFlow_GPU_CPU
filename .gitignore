@@ -17,3 +17,5 @@ dist/
 
 *.zip
 .claude/scheduled_tasks.lock
+.coverage
+htmlcov/

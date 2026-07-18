@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import datetime
 import gc
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+import cv2
 
 from core.image_loader import SUPPORTED_EXTENSIONS
 from core.gpu_session import GpuExecutionSession
@@ -65,6 +69,29 @@ class BatchInspectionProcessor(LogMixin):
         self.recursive = recursive
         self.progress_callback = progress_callback
         self.max_workers = max_workers
+        self._gc_interval = self._resolve_gc_interval()
+        self._gc_lock = threading.Lock()
+        self._gc_counter = 0
+
+    @staticmethod
+    def _resolve_gc_interval() -> int:
+        """Images processed between gc.collect(0) sweeps (0 disables it)."""
+        configured = os.getenv("AOI_BATCH_GC_INTERVAL")
+        if configured is not None:
+            try:
+                return max(0, int(configured))
+            except ValueError:
+                pass
+        return 8
+
+    def _maybe_collect(self) -> None:
+        if self._gc_interval <= 0:
+            return
+        with self._gc_lock:
+            self._gc_counter += 1
+            due = self._gc_counter % self._gc_interval == 0
+        if due:
+            gc.collect(0)
 
     def run(self) -> dict:
         image_paths = self.discover_images()
@@ -90,7 +117,9 @@ class BatchInspectionProcessor(LogMixin):
         worker_count = self._worker_count(total)
         self._progress(0, f"Batch inspection running with {worker_count} workers")
 
-        with GpuExecutionSession.from_recipe_path(self.recipe_path, workload="throughput") as gpu_session:
+        with self._opencv_thread_budget(worker_count), GpuExecutionSession.from_recipe_path(
+            self.recipe_path, workload="throughput"
+        ) as gpu_session:
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
                     executor.submit(
@@ -165,7 +194,7 @@ class BatchInspectionProcessor(LogMixin):
             )
         finally:
             result = None
-            gc.collect(0)
+            self._maybe_collect()
 
     def discover_images(self) -> list[Path]:
         if not self.input_dir.exists():
@@ -205,7 +234,30 @@ class BatchInspectionProcessor(LogMixin):
                 pass
 
         cpu_count = os.cpu_count() or 1
-        return max(1, min(4, cpu_count, image_count))
+        # Scale with available cores instead of a fixed cap of 4; oversubscription
+        # against OpenCV's own thread pool is handled by _opencv_thread_budget.
+        return max(1, min(8, cpu_count, image_count))
+
+    @contextlib.contextmanager
+    def _opencv_thread_budget(self, worker_count: int):
+        """Split cores between batch workers and OpenCV's internal pool.
+
+        Each worker runs a full CPU pipeline that itself parallelises via OpenCV.
+        With N workers each spawning cpu_count OpenCV threads the process would
+        heavily oversubscribe the CPU, so cap OpenCV threads to roughly an even
+        share for the duration of the batch and restore the prior setting after.
+        """
+        if worker_count <= 1:
+            yield
+            return
+        cpu_count = os.cpu_count() or 1
+        previous = cv2.getNumThreads()
+        per_worker = max(1, cpu_count // worker_count)
+        try:
+            cv2.setNumThreads(per_worker)
+            yield
+        finally:
+            cv2.setNumThreads(previous)
 
     @staticmethod
     def _build_summary(started_at: datetime.datetime, batch_output_dir: Path, results: list[BatchImageResult]) -> dict:

@@ -179,32 +179,32 @@
 
 ## P9：後續優化候選（效能、架構、可維護性）
 
-> 本區為 code review 後彙整的待評估候選，尚未實作。所有效能項目一律先加 profiler/benchmark 證明佔比，再依「不改變 recipe 語意、PASS/NG、座標與輸出格式」原則實作；不確定收益者不預設啟用。
+> 本區為 code review 後彙整的優化候選。所有效能項目依「不改變 recipe 語意、PASS/NG、座標與輸出格式」原則實作；不確定收益者不預設啟用（opt-in）。已完成項目均有 CPU 測試驗證，序列與平行路徑數值等價由 `tests/test_p9_optimizations.py` 固定。
 
 ### 效能
 
-- [ ] 單張檢測的 tile × detector 迴圈目前完全序列（`pipeline.py` detector loop）；評估對 CPU 路徑加入 tile 級 `ThreadPoolExecutor` 平行（OpenCV 釋放 GIL），涵蓋 OP/Monitor/單張大圖多 tile 即時情境，並確保與 GPU session `RLock` 序列化不衝突。
-- [ ] Reporter 輸出（overlay PNG、ng_tiles、CSV、matrix CSV、JSON）目前序列寫出（`core/reporter.py`）；評估平行寫檔、降低 `IMWRITE_PNG_COMPRESSION` 等級或 overlay 改 JPG，並將多 NG tile 的逐張 PNG + 逐 tile JSON sidecar 合併，降低 I/O 放大。
-- [ ] Batch 每張影像重新 `RecipeManager().load()` + template sync（`pipeline.py` recipe_setup）；評估在 batch 層 parse 一次、共用 recipe dict，避免大量影像重複解析 YAML。
-- [ ] Batch worker 上限寫死 `min(4, cpu_count, ...)`（`batch_processor.py:_worker_count`）；評估依 CPU 核數、影像尺寸與 GPU throughput 模式動態調整，並與 OpenCV 內部執行緒數協調避免 oversubscription。
-- [ ] `gc.collect(0)` 每張影像呼叫（`batch_processor.py:_process_image`）；benchmark 確認是否造成不必要停頓，多數情況交回自動 GC 可能更快。
-- [ ] GPU tiling 對 pattern-match／contour tile 模式仍無法使用 resident image（`pipeline.py` 僅 grid 走 resident ROI）；評估將 resident ROI 擴充到非 grid 模式，消除 synchronous crop round trips 的負優化。
+- [x] 單張檢測 tile × detector 迴圈加入 opt-in 的 tile 級 CPU 平行（`pipeline.py` `_inspect_tiles_parallel`）：透過 `performance.tile_workers` 或 `AOI_TILE_WORKERS` 啟用，僅在純 CPU（無 GPU detector／resident image）時生效，使用 thread-local detector 集避免共用 instance state；預設 1（與原路徑逐位元一致），序列/平行等價已測。
+- [x] Reporter 輸出可設定 `png_compression`（預設維持 OpenCV 原值、位元組不變），多 NG tile 的 PNG/JSON sidecar 以 bounded thread pool 平行寫出（`ng_tile_write_workers`，PNG encode/寫檔釋放 GIL），保留 tile 順序。
+- [x] Recipe 以 path+mtime 為 key 的 process-wide 快取（`recipe_manager._RecipeCache`），batch/monitor 跨影像只 parse+validate 一次並回傳 deepcopy；on-disk 編輯經 mtime 失效自動 reload。
+- [x] Batch worker 上限由固定 4 改為 `min(8, cpu_count, ...)`，並以 `_opencv_thread_budget` 於批次期間分配 OpenCV 內部執行緒（結束還原），避免 oversubscription；`AOI_BATCH_WORKERS`／`max_workers` 仍可覆寫。
+- [x] `gc.collect(0)` 由每張改為可設定週期 `AOI_BATCH_GC_INTERVAL`（預設每 8 張，0 可停用），保留釋放大型 result 參考以控制 peak memory。
+- [ ] GPU tiling 對 pattern-match／contour tile 模式仍無法使用 resident image（`pipeline.py` 僅 grid 走 resident ROI）；將 resident ROI 擴充到非 grid 模式屬 CUDA 變更，須 RTX 3090 實機編譯與數值驗證，另案處理。
 
 ### 架構與可維護性
 
-- [ ] `core/gpu_runtime.py`（~53KB 單檔）拆分為 ABI binding、resident image/ROI、metrics、fallback policy 等模組，降低維護與測試成本。
-- [ ] `AOIPipeline._run`（~220 行長方法）抽出 `ExecutionPlan`（GPU/CPU 與 resident 決策），讓主流程變薄、決策可獨立測試。
-- [ ] 核心結果結構（`execution.gpu.metrics...` 等深層 dict 字串 key 存取）改用 `TypedDict`/`dataclass`，降低打錯 key 與 refactor 風險。
-- [ ] 評估跨 detector 共用一份 tile preprocess 結果：目前 `TilePreprocessCache` 只快取 gray（`core/preprocess_cache.py`），相同 signature 的 resize/gaussian/adaptive 仍各 detector 重算。
+- [ ] `core/gpu_runtime.py`（~1200 行、其中 `GpuRuntime` 單一 class 逾千行 ctypes/CUDA 綁定）拆分：屬高風險且僅能部分於 CPU 驗證，應作為獨立、經 RTX 驗收的重構，不與本批 CPU 優化混合。
+- [x] `AOIPipeline._run` 抽出 `_build_gpu_runtime`（GPU/CPU runtime 決策）與 `_inspect_tile`／serial/parallel 分派，主流程變薄且決策可獨立測試。
+- [x] 核心結果結構改用 `core/result_types.py` 的 `TypedDict`（`InspectionResult`/`ExecutionBlock`/`GpuExecution` 等），並以 contract test 斷言真實 pipeline 輸出符合 schema；`AOIPipeline.run` 標注回傳型別。
+- [ ] 跨 detector 共用完整 preprocess 結果：現有 recipes detector signature 互異、實質收益近零且有共用可變 mask 風險，且 P5 已明訂「RTX profiler 證明有收益後才加入」，故維持延後。
 
 ### 測試與 CI
 
-- [ ] PR CI 加入以合成資料跑的 `benchmark_gate` smoke 與 coverage gate，防止效能與覆蓋率悄悄退化（現況僅 windows-ci + 手動/nightly RTX）。
+- [x] Windows PR CI 加入 coverage gate（`coverage --source=core,detectors --fail-under=70`，現況 76%）與 tile-parallel CPU smoke（`AOI_TILE_WORKERS=4`）；GPU-only 的 `benchmark_gate`（比較 RTX p95）維持在 RTX workflow。
 
 ### GUI 與產品
 
-- [ ] Batch dashboard／scatter 大資料量時的 UI 反應：評估表格虛擬化與圖表資料抽樣。
-- [ ] 新增 per-detector debug image export（threshold／contour／morphology 中間結果），提升現場調機效率，預設關閉僅工程模式開啟。
+- [ ] Batch dashboard／scatter 大資料量時的表格虛擬化與圖表抽樣屬 GUI 效能，headless 難以驗證，另案處理。
+- [x] 新增 per-detector debug image export（`output.save_debug_images`，預設關閉）：於共用 preprocess 出口統一擷取各 detector 中間 mask（涵蓋 401/401-1/401-2/900），輸出到 `debug/`，runtime-only payload 不進 JSON。
 
 ## RTX 3090 編譯與實機驗收
 
@@ -315,3 +315,4 @@
 - [x] 2026-07-17：修正 Windows CLI smoke 的 exit code 判斷，明確接受 PASS=0 與 NG=2，並讓未捕捉例外等其他 exit code 正確使 CI 失敗。
 - [x] 2026-07-17：完成 P8 產線安全與持續驗證：strict detector schema/GUI 共用、recipe/build SHA-256/commit provenance、NG dataset sidecar、五配方與每 detector 至少五個合成 golden cases、Python 3.13 Windows lock、RTX 48h heartbeat/P95 15% gate/weekly package smoke、100-case Hypothesis preprocess fuzz，並拆分 GPU ABI 與 metrics；本機 CPU-compatible PyInstaller build 及 packaged smoke exit 0。
 - [x] 2026-07-17：新增根目錄 `CLAUDE.md` 作為 Claude Code 的快速索引（進入點、模組地圖、`gpu.mode`/PreprocessPlan/CPU fallback 不變量、唯一 roadmap 紀律與必跑驗證），與 `AGENT.md` 同一套規範；並將 `aoi-verify-push` 補成 repo 內版控的 `.claude/skills/aoi-verify-push/SKILL.md`，涵蓋驗證矩陣、Todo 更新、安全 staging 與 commit/push 流程。
+- [x] 2026-07-18：完成 P9 第一批 CPU 優化並以 `tests/test_p9_optimizations.py`（12 案）驗證：process-wide recipe 快取（path+mtime，deepcopy，mtime 失效）、batch worker 上限 4→`min(8,cpu)` 加 `_opencv_thread_budget` 還原、`AOI_BATCH_GC_INTERVAL` 週期 GC、Reporter `png_compression`＋NG tile 平行寫、opt-in tile 級 CPU 平行（thread-local detectors，序列/平行等價）、per-detector debug image export（共用 preprocess 出口，涵蓋四 detector，不進 JSON）、`_run` 抽出 `_build_gpu_runtime`、`core/result_types.py` TypedDict 契約與 contract test、Windows CI coverage gate（`--fail-under=70`，現況 76%）＋tile-parallel smoke。全套 119 tests 綠燈、compileall／cuda preflight 通過、6 影像 batch E2E（54 tiles/54 debug/0 error）實跑成功。resident-ROI 非 grid、`gpu_runtime` 拆分、跨 detector cache 與 dashboard 虛擬化因需 RTX 或屬高風險／GUI 效能另案，於 P9 標註延後與理由。
