@@ -206,6 +206,18 @@
 - [ ] Batch dashboard／scatter 大資料量時的表格虛擬化與圖表抽樣屬 GUI 效能，headless 難以驗證，另案處理。
 - [x] 新增 per-detector debug image export（`output.save_debug_images`，預設關閉）：於共用 preprocess 出口統一擷取各 detector 中間 mask（涵蓋 401/401-1/401-2/900），輸出到 `debug/`，runtime-only payload 不進 JSON。
 
+### 後續工作（延後項目與本批衍生追蹤）
+
+> 以下為 P9 未完成／延後項目的具體待辦與驗收標準，供後續排程。前四項為原延後項目，後段為本批 CPU 優化在 RTX 上線後需補的驗證與調參。
+
+- [ ] **非 grid resident ROI**：讓 pattern-match／contour tile 模式也能吃 device resident image，消除 synchronous crop round trips。前置：RTX 3090 可編譯 CUDA；驗收：非 grid 每張原圖僅一次 H2D、CPU/GPU tiles/PASxNG/bbox 等價、無 stale handle。
+- [ ] **`core/gpu_runtime.py` 拆分**：將 `GpuResidentImage`/`GpuDeviceRoi`/`GpuRoiBatch` 等值型別與 metrics、fallback policy 抽出獨立模組，`GpuRuntime` 保留 ctypes 綁定；以 `__init__` re-export 維持既有 import。前置：作為獨立 PR，不與 CPU 優化混合；驗收：全測試綠燈 + RTX runtime/session 測試通過。
+- [ ] **跨 detector 完整 preprocess cache**：在 RTX profiler 證明同一 tile 上有可共用 signature 且有收益後，於 `TilePreprocessCache` 以 plan signature 記憶結果並 copy-on-hit；驗收：命中時輸出與逐 detector 重算逐位元一致，未命中零額外成本。（受 P5「RTX profiler 證明有收益後才加入」約束）
+- [ ] **Batch dashboard／scatter 虛擬化**：大批次時 `QTableWidget`／scatter 改為虛擬化與資料抽樣；驗收：千列以上捲動不卡、記憶體不隨列數線性膨脹，並補 GUI 觀測測試。
+- [ ] **RTX 驗證 tile 級平行不影響 GPU 路徑**：`AOI_TILE_WORKERS>1` 時確認純 CPU 才啟用、GPU detector/resident 影像維持序列（單一 GPU queue），無競爭或 VRAM 累積。
+- [ ] **以實機 benchmark 調校預設值**：worker 上限（8）、`AOI_BATCH_GC_INTERVAL`（8）、`png_compression` 與 `ng_tile_write_workers` 目前為保守預設；用固定資料集量測 median/P95、peak RSS 與輸出檔大小後，決定 production 建議值。
+- [ ] **coverage gate 逐步提高門檻**：現況 78%，待補 `tiler.py`／`monitor_processor.py`／`reporter` 測試後，將 `--fail-under` 由 70 分階段上調。
+
 ## RTX 3090 編譯與實機驗收
 
 ### 環境與編譯
