@@ -276,21 +276,74 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
         print(f"PASS fused_401_2 persistent context reuse: {second_context_stats}")
     else:
         print(f"SKIP fused_401_2_bgr: {runtime.fused_unavailable_reason}")
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    for operation, cv_operation in (
+    # Separable + iteration-collapsed morphology must stay bit-exact with the CPU
+    # reference across iteration counts (N passes fold into a single radius=N*(k//2)
+    # structuring element) and at image borders (neutral-border clipping). Cover
+    # every operation on 1- and 3-channel data, both odd kernels, small iteration
+    # counts and detector-401's iterations=10, using tiny images plus corner
+    # impulses so the structuring element overruns the edges.
+    rng_morph = np.random.default_rng(20260720)
+    corner_dots = np.zeros((24, 32), dtype=np.uint8)
+    corner_dots[2, 3] = 255
+    corner_dots[21, 29] = 255
+    morph_cases = {
+        "binary": binary,
+        "rand_gray": rng_morph.integers(0, 256, size=(24, 32), dtype=np.uint8),
+        "corner_dots_gray": corner_dots,
+        "rand_bgr": rng_morph.integers(0, 256, size=(24, 32, 3), dtype=np.uint8),
+    }
+    morph_ops = (
         ("open", cv2.MORPH_OPEN),
         ("close", cv2.MORPH_CLOSE),
         ("dilate", cv2.MORPH_DILATE),
         ("erode", cv2.MORPH_ERODE),
-    ):
-        expected = (
-            cv2.morphologyEx(binary, cv_operation, kernel, iterations=1)
-            if operation in {"open", "close"}
-            else cv2.dilate(binary, kernel, iterations=1)
-            if operation == "dilate"
-            else cv2.erode(binary, kernel, iterations=1)
+    )
+    for case_name, case in morph_cases.items():
+        for kernel_size in (3, 5):
+            rect = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+            for iterations in (1, 2, 3, 10):
+                for operation, cv_operation in morph_ops:
+                    if operation == "dilate":
+                        expected = cv2.dilate(case, rect, iterations=iterations)
+                    elif operation == "erode":
+                        expected = cv2.erode(case, rect, iterations=iterations)
+                    else:
+                        expected = cv2.morphologyEx(case, cv_operation, rect, iterations=iterations)
+                    metrics.append(compare(
+                        f"morphology_{case_name}_{operation}_k{kernel_size}_i{iterations}",
+                        runtime.morphology(case, operation, kernel_size, iterations),
+                        expected,
+                    ))
+    # Same collapse inside the native linear plan (no lossy neighbour op to hide a
+    # mismatch) and the native DAG plan (two morphology nodes share one gray parent,
+    # so a kernel that wrote to its input instead of scratch would corrupt the other).
+    if runtime.supports_native_plan:
+        morph_native_plan = PreprocessPlan(
+            (Morphology("open", 5, 10),), name="native_morphology_open_k5_i10"
         )
-        metrics.append(compare(f"morphology_{operation}", runtime.morphology(binary, operation, 3, 1), expected))
+        metrics.append(compare(
+            morph_native_plan.name,
+            runtime.execute_plan(morph_cases["rand_bgr"], morph_native_plan),
+            CpuPreprocessExecutor().execute(morph_cases["rand_bgr"], morph_native_plan),
+        ))
+    if runtime.supports_native_dag_plan:
+        morph_dag_plan = PreprocessDagPlan(
+            name="native_morphology_shared_input",
+            nodes=(
+                PreprocessDagNode("gray", "root", Gray()),
+                PreprocessDagNode("opened", "gray", Morphology("open", 5, 10)),
+                PreprocessDagNode("closed", "gray", Morphology("close", 3, 4)),
+            ),
+            outputs=("opened", "closed"),
+        )
+        morph_dag_expected = CpuPreprocessDagExecutor().execute(morph_cases["rand_bgr"], morph_dag_plan)
+        morph_dag_actual = runtime.execute_dag_plan(morph_cases["rand_bgr"], morph_dag_plan)
+        for name in morph_dag_plan.outputs:
+            metrics.append(compare(
+                f"{morph_dag_plan.name}_{name}",
+                morph_dag_actual[name],
+                morph_dag_expected[name],
+            ))
     if runtime.supports_native_plan:
         native_plans = (
             PreprocessPlan(
@@ -763,7 +816,7 @@ def benchmark_morphology_iterations(
         "warmup": max(0, int(warmup)),
         "measurements": measurements,
         "optimization_selected": False,
-        "note": "Separable morphology remains gated on RTX correctness and measured benefit.",
+        "note": "Kernel is separable with iteration collapse; production routing changes remain gated on RTX measured benefit.",
     }
     print(f"MORPHOLOGY_PROFILE {result}")
     return result
