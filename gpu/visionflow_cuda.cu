@@ -846,15 +846,40 @@ __global__ void adaptive_integral_kernel(
     dst[y * width + x] = static_cast<uint8_t>(selected ? max_value : 0);
 }
 
-__global__ void morph_kernel(const uint8_t* src, uint8_t* dst, int width, int height, int channels, int radius, int dilate) {
+// Morphology with a flat rectangular structuring element is separable: a 2D
+// min/max over a (2r+1)x(2r+1) window equals a horizontal 1D pass followed by a
+// vertical 1D pass. OpenCV's default morphology border is the neutral value
+// (+inf for erosion / -inf for dilation), which for uint8 data means an
+// out-of-bounds sample never changes the min/max. That is identical to simply
+// clamping the 1D window to the in-bounds range, so these kernels are bit-exact
+// with the previous naive O(k^2) kernel while touching O(2*(2r+1)) samples per
+// pixel instead of O((2r+1)^2).
+__global__ void morph_horizontal_kernel(const uint8_t* src, uint8_t* dst, int width, int height, int channels, int radius, int dilate) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
+    int lo = max(0, x - radius);
+    int hi = min(width - 1, x + radius);
     for (int c = 0; c < channels; ++c) {
         int value = dilate ? 0 : 255;
-        for (int ky = -radius; ky <= radius; ++ky) for (int kx = -radius; kx <= radius; ++kx) {
-            int sx = x + kx, sy = y + ky;
-            int sample = (sx < 0 || sx >= width || sy < 0 || sy >= height) ? (dilate ? 0 : 255) : src[(sy * width + sx) * channels + c];
+        for (int sx = lo; sx <= hi; ++sx) {
+            int sample = src[(y * width + sx) * channels + c];
+            value = dilate ? max(value, sample) : min(value, sample);
+        }
+        dst[(y * width + x) * channels + c] = static_cast<uint8_t>(value);
+    }
+}
+
+__global__ void morph_vertical_kernel(const uint8_t* src, uint8_t* dst, int width, int height, int channels, int radius, int dilate) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    int lo = max(0, y - radius);
+    int hi = min(height - 1, y + radius);
+    for (int c = 0; c < channels; ++c) {
+        int value = dilate ? 0 : 255;
+        for (int sy = lo; sy <= hi; ++sy) {
+            int sample = src[(sy * width + x) * channels + c];
             value = dilate ? max(value, sample) : min(value, sample);
         }
         dst[(y * width + x) * channels + c] = static_cast<uint8_t>(value);
@@ -884,6 +909,42 @@ __global__ void gather_roi_batch_kernel(
 }
 
 dim3 grid2d(int width, int height) { return dim3((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y); }
+
+// Runs one separable erosion/dilation (radius R, neutral border). `mid` must be
+// a scratch buffer distinct from `src` and `dst`; `src` and `dst` may alias.
+void launch_morph_separable(uint8_t* src, uint8_t* mid, uint8_t* dst,
+                            int width, int height, int channels, int radius,
+                            int dilate, cudaStream_t stream) {
+    dim3 grid = grid2d(width, height);
+    dim3 block(BLOCK_X, BLOCK_Y);
+    morph_horizontal_kernel<<<grid, block, 0, stream>>>(src, mid, width, height, channels, radius, dilate);
+    morph_vertical_kernel<<<grid, block, 0, stream>>>(mid, dst, width, height, channels, radius, dilate);
+}
+
+// Full rect morphology (erode/dilate/open/close) with N iterations collapsed
+// into a single wider structuring element. N iterations of a radius-r rect
+// erosion (or dilation) with a neutral border is exactly one radius-(N*r)
+// erosion (dilation), so open/close cost at most two separable passes total
+// regardless of `iterations`. `mid` and `out` are scratch buffers, each
+// distinct from `src` and from each other; `src` is never written (safe for a
+// shared DAG input). Returns the buffer holding the result (always `out`).
+uint8_t* launch_morphology(uint8_t* src, uint8_t* mid, uint8_t* out,
+                           int width, int height, int channels,
+                           int operation, int kernel, int iterations,
+                           cudaStream_t stream) {
+    int radius = (kernel / 2) * iterations;
+    if (operation == VF_MORPH_OPEN) {
+        launch_morph_separable(src, mid, out, width, height, channels, radius, 0, stream);
+        launch_morph_separable(out, mid, out, width, height, channels, radius, 1, stream);
+    } else if (operation == VF_MORPH_CLOSE) {
+        launch_morph_separable(src, mid, out, width, height, channels, radius, 1, stream);
+        launch_morph_separable(out, mid, out, width, height, channels, radius, 0, stream);
+    } else {
+        launch_morph_separable(src, mid, out, width, height, channels, radius,
+                               operation == VF_MORPH_DILATE, stream);
+    }
+    return out;
+}
 }
 
 static int execute_linear_plan_device(
@@ -970,25 +1031,12 @@ static int execute_linear_plan_device(
             case VF_PLAN_MORPHOLOGY: {
                 context->timing_has_morphology = true;
                 cudaEventRecord(context->timing_events[TIMING_MORPHOLOGY_START], context->stream);
-                const int operation = op.int_params[0];
-                const int kernel = op.int_params[1];
-                const int iterations = op.int_params[2];
-                const int passes = (operation == VF_MORPH_OPEN || operation == VF_MORPH_CLOSE)
-                    ? iterations * 2 : iterations;
-                uint8_t* source_buffer = current;
-                uint8_t* next = current == context->u8[1] ? context->u8[2] : context->u8[1];
-                uint8_t* destination = passes % 2 == 1 ? next : context->u8[4];
-                for (int pass = 0; pass < passes; ++pass) {
-                    int dilate = operation == VF_MORPH_DILATE;
-                    if (operation == VF_MORPH_OPEN) dilate = pass >= iterations;
-                    if (operation == VF_MORPH_CLOSE) dilate = pass < iterations;
-                    morph_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
-                        source_buffer, destination, width, height, channels, kernel / 2, dilate);
-                    source_buffer = destination;
-                    destination = destination == next ? context->u8[4] : next;
-                }
+                uint8_t* mid = context->u8[4];
+                uint8_t* out = current == context->u8[1] ? context->u8[2] : context->u8[1];
+                current = launch_morphology(current, mid, out, width, height, channels,
+                                            op.int_params[0], op.int_params[1], op.int_params[2],
+                                            context->stream);
                 cudaEventRecord(context->timing_events[TIMING_MORPHOLOGY_END], context->stream);
-                current = source_buffer;
                 break;
             }
             default:
@@ -1090,24 +1138,13 @@ static int execute_dag_plan_device(
             case VF_PLAN_MORPHOLOGY: {
                 context->timing_has_morphology = true;
                 cudaEventRecord(context->timing_events[TIMING_MORPHOLOGY_START], context->stream);
-                const int operation = op.int_params[0];
-                const int iterations = op.int_params[2];
-                const int passes = (operation == VF_MORPH_OPEN || operation == VF_MORPH_CLOSE)
-                    ? iterations * 2 : iterations;
-                uint8_t* source_buffer = input;
-                uint8_t* destination = passes % 2 == 1 ? output : context->u8[4];
-                for (int pass = 0; pass < passes; ++pass) {
-                    int dilate = operation == VF_MORPH_DILATE;
-                    if (operation == VF_MORPH_OPEN) dilate = pass >= iterations;
-                    if (operation == VF_MORPH_CLOSE) dilate = pass < iterations;
-                    morph_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
-                        source_buffer, destination, width, height, channels,
-                        op.int_params[1] / 2, dilate);
-                    source_buffer = destination;
-                    destination = destination == output ? context->u8[4] : output;
-                }
+                // `input` is a shared node value and must not be written; use the
+                // node's own `output` as the result buffer and u8[4] as scratch.
+                values[index] = launch_morphology(input, context->u8[4], output,
+                                                  width, height, channels,
+                                                  op.int_params[0], op.int_params[1],
+                                                  op.int_params[2], context->stream);
                 cudaEventRecord(context->timing_events[TIMING_MORPHOLOGY_END], context->stream);
-                values[index] = source_buffer;
                 break;
             }
             default:
@@ -1969,27 +2006,19 @@ VF_CUDA_API int vf_morphology_rect_u8(const uint8_t* src,int w,int h,int stride,
     if (sc != dc || (sc != 1 && sc != 3) || kernel < 3 || kernel % 2 == 0 || iterations < 1 || operation < VF_MORPH_OPEN || operation > VF_MORPH_ERODE) {
         return VF_CUDA_INVALID_ARGUMENT;
     }
-    uint8_t *a = nullptr, *b = nullptr;
+    uint8_t *a = nullptr, *b = nullptr, *m = nullptr;
     int result = alloc_copy(src, w, h, stride, sc, &a);
     if (result != VF_CUDA_OK) return result;
     result = visionflow_cuda::allocate_bytes(&b, static_cast<size_t>(w) * h * sc);
     if (result != VF_CUDA_OK) { visionflow_cuda::free_device(a); return result; }
-    auto pass = [&](int dilate) {
-        morph_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(a, b, w, h, sc, kernel / 2, dilate);
-        std::swap(a, b);
-    };
-    if (operation == VF_MORPH_OPEN) {
-        for (int i = 0; i < iterations; ++i) pass(0);
-        for (int i = 0; i < iterations; ++i) pass(1);
-    } else if (operation == VF_MORPH_CLOSE) {
-        for (int i = 0; i < iterations; ++i) pass(1);
-        for (int i = 0; i < iterations; ++i) pass(0);
-    } else {
-        for (int i = 0; i < iterations; ++i) pass(operation == VF_MORPH_DILATE);
-    }
+    result = visionflow_cuda::allocate_bytes(&m, static_cast<size_t>(w) * h * sc);
+    if (result != VF_CUDA_OK) { visionflow_cuda::free_device(a); visionflow_cuda::free_device(b); return result; }
+    // `a` holds the input copy; `m` is the separable H/V scratch, `b` the result.
+    uint8_t* out = launch_morphology(a, m, b, w, h, sc, operation, kernel, iterations, 0);
     result = visionflow_cuda::kernel_result();
-    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, sc, a);
-    else visionflow_cuda::free_device(a);
-    visionflow_cuda::free_device(b);
+    if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, w, h, sc, out);
+    else visionflow_cuda::free_device(out);
+    visionflow_cuda::free_device(a);
+    visionflow_cuda::free_device(m);
     return result;
 }
