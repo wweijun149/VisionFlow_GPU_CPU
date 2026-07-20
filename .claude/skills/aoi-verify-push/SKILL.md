@@ -1,6 +1,6 @@
 ---
 name: aoi-verify-push
-description: Run the VisionFlow AOI validation matrix, update Todo.md, then safely stage, commit and push a completed change. Use after finishing any code change in this repo — pipeline, detector, recipe, GPU/CUDA, GUI, packaging, or CI — and before reporting the work as done. Enforces CPU-first correctness, old-DLL fallback, and the rule that CUDA source is never claimed built/validated unless nvcc actually ran.
+description: Run the VisionFlow AOI validation matrix, update Todo.md, safely stage/commit/push a completed change, then open a PR to the default branch and merge it. Use after finishing any code change in this repo — pipeline, detector, recipe, GPU/CUDA, GUI, packaging, or CI — and before reporting the work as done. Enforces CPU-first correctness, old-DLL fallback, and the rule that CUDA source is never claimed built/validated unless nvcc actually ran.
 ---
 
 # aoi-verify-push
@@ -74,7 +74,24 @@ git status -sb
 - push 失敗若為網路錯誤，最多重試 4 次（2s、4s、8s、16s backoff）。
 - 除非使用者明確要求，否則完成且驗證過的變更都要 push。
 
-### 6. 回報
+### 6. 開 PR 並合併進預設分支
+
+feature 分支 push 成功後，對預設分支（`main`）開 PR 並合併，不必等使用者再確認（使用者已授權自動化此流程）。
+
+```powershell
+git rev-parse --abbrev-ref HEAD          # 確認在 feature 分支，不是 main
+git log --oneline origin/main..HEAD      # 確認要進 main 的 commit
+```
+
+- 開 PR 前先找 PR 模板（`.github/pull_request_template.md`、`.github/PULL_REQUEST_TEMPLATE.md`、根目錄或 `docs/` 版本、`.github/PULL_REQUEST_TEMPLATE/`）；有就照其章節填，沒有就正常寫。
+- PR 標題精簡描述結果；內文寫清楚改了什麼、CPU/fallback/相容性影響、跑了哪些驗證。
+- **CUDA source 有改但無 `nvcc`**：PR 內文必須明講「DLL 未重編、未經 runtime／CPU 對拍驗證」，且 RTX 3090 驗收項目在 `Todo.md` 保持未勾。合併原始碼進 `main` 是可以的（與既有先例一致），但**絕不聲稱已編譯／已驗證**。
+- 合併方式預設 merge commit（保留 feature 分支歷史）；PR 合併後該 PR 即結案，後續新工作不得再堆到已合併歷史上。
+- 若目標 PR 已被合併，視為全新變更：從最新 `main` 重開同名分支再推。
+
+回報中附上 PR 連結與合併後的 merge commit。
+
+### 7. 回報
 
 - 改了什麼、勾了哪些 roadmap 項目。
 - CPU、fallback、GUI、CUDA、相容性影響。

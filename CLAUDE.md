@@ -45,7 +45,7 @@ Python 命令一律使用工作區虛擬環境：`.\env\Scripts\python.exe`。
 
 ## Skills
 
-- `aoi-verify-push`：完成程式修改後，依模組類型執行對應驗證矩陣、更新 `Todo.md`、安全 staging 並 commit/push。詳見 `.claude/skills/aoi-verify-push/SKILL.md`。
+- `aoi-verify-push`：完成程式修改後，依模組類型執行對應驗證矩陣、更新 `Todo.md`、安全 staging 並 commit/push，再對 `main` 開 PR 並合併。詳見 `.claude/skills/aoi-verify-push/SKILL.md`。
 
 ## 完成前必跑驗證
 
