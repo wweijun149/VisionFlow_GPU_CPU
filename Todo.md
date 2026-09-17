@@ -2,6 +2,10 @@
 
 本文件是專案唯一的工作清單，涵蓋 CPU、GPU、CUDA、Detector、GUI、打包、CI 與實機驗收。完成程式修改時必須同步更新對應 checkbox；不得再建立分散的 CPU/GPU Todo 文件。
 
+> **標記說明 `🔒實物樣本`**：標註此標記的項目需要真實產線 PASS/NG 照片才能完成。本開發／驗證環境（雲端 Linux 容器）永遠不會有實物照片，量測數據也不會回饋至此，因此這些項目**無法在本環境完成**，須在取得真實樣本的產線環境另行驗收。
+>
+> 此標記與 RTX 3090 GPU 編譯／實測**不同**：GPU 相關項目可在具 `nvcc`／NVIDIA GPU 的機器上驗證，並非永久受阻；只有帶 `🔒實物樣本` 的項目在缺實物照片時才是永久卡住。
+
 ## 開發原則
 
 - CPU 路徑是正確性基準，也是無 NVIDIA GPU、DLL 載入失敗、CUDA error 或顯存不足時的 fallback。
@@ -33,7 +37,7 @@
 - [x] 加入 GUI 顯示、QImage/QPixmap 轉換與使用者實際等待時間計時。
 - [x] DLL 加入 CUDA event，拆分 context、allocation、H2D、device copy、kernel、synchronize、D2H 與 free；RTX 數值驗證仍列在實機驗收清單。
 - [x] benchmark JSON 保存 CPU、GPU、RAM、Driver、recipe、影像資訊與 commit hash；Toolkit 另由 runner environment artifact 保存。
-- [ ] 在 RTX 3090 固定 production 測試集執行並建立可重現 baseline。（workflow_dispatch 已支援可選 production manifest；待真實樣本與 runner）
+- [ ] 🔒實物樣本 在 RTX 3090 固定 production 測試集執行並建立可重現 baseline。（workflow_dispatch 已支援可選 production manifest；待真實樣本與 runner）
 - [x] benchmark 分開記錄 cold、warm-up 次數、純檢測與既有 pipeline/report 端到端數據。
 - [x] benchmark 記錄平均、median、P95、process CPU%、GPU utilization、VRAM、溫度與功耗快照。
 
@@ -42,9 +46,9 @@
 - [x] 缺少 DLL 時，CPU fallback 與純 CPU 的 PASS/NG、tiles、defects、bbox 與 metadata 完整一致。
 - [x] fused GPU 呼叫失敗時不採用部分結果，整個 detector 重新從 CPU preprocess 開始執行。
 - [x] 建立固定 random seed 合成測例：BGR、gray、全黑、全白、棋盤格與邊界像素。
-- [ ] 補入固定真實 AOI 影像測例；manifest schema、路徑/標籤/coverage 驗證已完成，待取得可追蹤的生產樣本後執行。
+- [ ] 🔒實物樣本 補入固定真實 AOI 影像測例；manifest schema、路徑/標籤/coverage 驗證已完成，待取得可追蹤的生產樣本後執行。
 - [x] 覆蓋奇數尺寸、極小圖、4K、non-contiguous stride、1/3 channels 與不同 ROI 尺寸。
-- [ ] 五個 production recipes 各準備至少一張 PASS 與一張 NG 樣本；`gpu/production_manifest.example.yaml` 已固定所需 10 個 case，影像待提供。
+- [ ] 🔒實物樣本 五個 production recipes 各準備至少一張 PASS 與一張 NG 樣本；`gpu/production_manifest.example.yaml` 已固定所需 10 個 case，影像待提供。
 - [ ] 實機注入 kernel error、CUDA 初始化失敗與 OOM，確認 fallback 後無 stale pointer 或錯誤中間結果。（loader tests 已覆蓋 ABI mismatch、無 device、context init failure；fake execution/OOM recovery 已完成，實機注入待 RTX）
 - [x] `fallback_to_cpu: false` 且 CUDA DLL 不可用時必須明確失敗，不可回報假的 GPU success。
 
@@ -244,12 +248,12 @@
 
 ### Production recipes、GUI、打包與壓測
 
-- [ ] `PRODUCT_A_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_NEGATIVE_401_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_WHITE_RATIO_401_2_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_FRAME_900_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] 比較 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
+- [ ] 🔒實物樣本 `PRODUCT_A_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 🔒實物樣本 `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 🔒實物樣本 `PRODUCT_A_NEGATIVE_401_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 🔒實物樣本 `PRODUCT_A_WHITE_RATIO_401_2_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 🔒實物樣本 `PRODUCT_A_FRAME_900_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 🔒實物樣本 比較 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
 - [ ] GUI 的 recipe 儲存/載入、viewer backend、status、overlay、輸出與 fallback 正確。
 - [ ] 打包版在有 NVIDIA GPU 與無 NVIDIA GPU 電腦均完成驗證。（目前無 GPU 電腦已完成 CPU-compatible package build 與 bundled recipe/MainWindow smoke；有 GPU 電腦待驗收）
 - [ ] warm-up 5 張後測 10、100、1000 張；VRAM 穩定、GUI 可回應、無 crash/error。（validator/workflow 已加入 checkpoints、allocation/VRAM/median/P95；待 RTX 執行）
@@ -331,4 +335,5 @@
 - [x] 2026-07-17：新增根目錄 `CLAUDE.md` 作為 Claude Code 的快速索引（進入點、模組地圖、`gpu.mode`/PreprocessPlan/CPU fallback 不變量、唯一 roadmap 紀律與必跑驗證），與 `AGENT.md` 同一套規範；並將 `aoi-verify-push` 補成 repo 內版控的 `.claude/skills/aoi-verify-push/SKILL.md`，涵蓋驗證矩陣、Todo 更新、安全 staging 與 commit/push 流程。
 - [x] 2026-07-18：完成 P9 第一批 CPU 優化並以 `tests/test_p9_optimizations.py`（12 案）驗證：process-wide recipe 快取（path+mtime，deepcopy，mtime 失效）、batch worker 上限 4→`min(8,cpu)` 加 `_opencv_thread_budget` 還原、`AOI_BATCH_GC_INTERVAL` 週期 GC、Reporter `png_compression`＋NG tile 平行寫、opt-in tile 級 CPU 平行（thread-local detectors，序列/平行等價）、per-detector debug image export（共用 preprocess 出口，涵蓋四 detector，不進 JSON）、`_run` 抽出 `_build_gpu_runtime`、`core/result_types.py` TypedDict 契約與 contract test、Windows CI coverage gate（`--fail-under=70`，現況 76%）＋tile-parallel smoke。全套 119 tests 綠燈、compileall／cuda preflight 通過、6 影像 batch E2E（54 tiles/54 debug/0 error）實跑成功。resident-ROI 非 grid、`gpu_runtime` 拆分、跨 detector cache 與 dashboard 虛擬化因需 RTX 或屬高風險／GUI 效能另案，於 P9 標註延後與理由。
 - [x] 2026-07-18：新增 overlay 輸出策略（`overlay_format` png/jpg、`overlay_jpeg_quality`、`overlay_max_dim`）並加 4 個測試（`tests/test_p9_optimizations.py`，共 123 tests 綠燈）；預設 PNG 位元組不變，overlay 全解析度繪製後才降採樣故 JSON/CSV 座標不變，實測 2048² overlay PNG 38.8ms→JPG 18.0ms。經確認 image loader 不可盲換 cv2.imread（OpenCV `1<<30` 像素上限低於 17 億 px 巨圖且會丟 error、又不套 EXIF），保留 Pillow `MAX_IMAGE_PIXELS=None` 主線，尺寸/格式感知 hybrid 列入 P9 後續工作；PASS overlay 依既有 `save_overlay` 開關，不新增自動略過。
+- [x] 2026-09-17：新增 `🔒實物樣本` 標記與圖例，標註需要真實產線 PASS/NG 照片才能完成、且在無實物照片的雲端環境永久無法驗收的項目：production 測試集 baseline、真實 AOI 影像測例、五 recipes PASS/NG 樣本與其等價比較、五 production recipes 逐一 PASS/NG 一致。此標記與 RTX 3090 GPU 編譯／實測項目明確區分——後者可在具 nvcc/GPU 的機器上驗證，並非永久受阻。CPU/GPU 等價門檻與 benchmark 加速門檻可用合成／代表性影像量測，故不列入實物樣本標記。
 - [ ] 2026-07-20：將 morphology CUDA kernel 由 naive O(k²) 2D window 改為 separable H/V min/max（`morph_horizontal_kernel`/`morph_vertical_kernel`），並將 N iterations 折疊為單一 radius=N·(kernel/2) 的寬 kernel（rect SE + neutral border 下 iterated == single wide，數學等價）。新增 `launch_morph_separable`/`launch_morphology` host helper，linear native plan、DAG native plan 與 `vf_morphology_rect_u8` primitive 三個呼叫點統一改用；open/close 由最多 2N passes 降為固定 2 個 separable pass（4 kernel launch），detector 401（3ch, open, iter=10）與 401-1（1ch）受惠。每像素取樣由 O((2r+1)²) 降為 O(2·(2N r+1))。與原 naive kernel neutral-border 語意 bit-exact（clamp window == 忽略 OOB）。primitive 路徑多配置一塊 H/V 中間 scratch。`gpu/validate_cuda_dll.py` 補上 morphology bit-exact 對拍缺口：primitive 覆蓋 open/close/dilate/erode × kernel 3/5 × iterations 1/2/3/10 × {binary, rand_gray, corner_dots_gray(角落脈衝壓邊界), rand_bgr(3ch)}；另加 morphology-only native linear plan（open k5 i10, 3ch，無 Gaussian/Adaptive 遮掩誤差）與 native DAG（兩個 morphology node 共用同一 gray 父節點，驗證 kernel 不會寫壞共享 input），全部 max_diff=0/mismatch_ratio=0。**開發機無 nvcc，DLL 未重編、未經 runtime／CPU 對拍驗證**；RTX 3090 morphology CPU-parity 與 benchmark 佔比仍為待辦（見「RTX 3090 編譯與實機驗收」）。
